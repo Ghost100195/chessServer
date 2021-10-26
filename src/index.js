@@ -1,3 +1,5 @@
+const Jimp = require('jimp');
+const {v4} = require('uuid')
 const fs = require('fs')
 const path = require("path");
 const express = require('express')
@@ -15,11 +17,32 @@ const staticFileMiddleware = express.static('dist');
 app.use(staticFileMiddleware);
 
 const SEPERATOR = "%"
-const dataDir = path.join(__dirname, "../data")
+const dataDir = path.join(__dirname, "../data/games")
 const finishedGames = require('./assets/finished.json')
 const allGames = {}
 const inPlay = {}
 let cams = []
+
+
+/**
+ * /game/start/auto
+ * /game/start/manually
+ *
+ * /game/next/auto/:id/:index
+ * /game/next/manually/:id/:index
+ *
+ * /game/next/manually/finish/:id
+ *
+ * /game/delete/:id
+ *
+ * /history/list
+ *
+ * /image/list/:id
+ * /image/list/:id/:index
+ * /image/:filename
+ *
+ * /setup/cam/search
+ * */
 
 loadGamePlayback()
 /**
@@ -30,40 +53,77 @@ loadGamePlayback()
  * photo name = 1631897814.055475--0--rnbqkbnr_pppppppp_11111111_11111111_11111111_11111N11_PPPPPPPP_RNBQKB1R--g1f3--0.0
  * */
 
-const handleSave = async (req, res) => {
-    const {id, index} = req.params
-    const {fen, pgnMove} = req.body
-    let nIndex = Number.parseInt(index)
-    if (!inPlay[id]) {
-        res.status(500).send({
-            msg: "Please start the game before accessing this Endpoint"
-        })
-        return;
-    }
+async function saveImage({id, index, fen, pgnMove}){
     // get photo
     const images = (await Promise.all(cams.map(async x => {
-        return await axios.get(x + "/picture", {
-            responseType: 'arraybuffer'
-        })
+        try {
+            const response = await axios.get("http://" + x + "/picture", {
+                responseType: 'arraybuffer',
+                timeout: 5000
+            })
+            return {
+                ip: x,
+                status: response.status,
+                image: response.data
+            }
+        }catch(e){
+            console.log("Error: No picture from: " + x)
+            return {
+                ip: x,
+                status: 500,
+                image: null
+            }
+        }
     }))).filter(x => x.status === 200)
 
-    console.log(cams)
     // save photo to dir
-    const imageNames = images.map((x, i) => {
-        const fileName = [id, index, fen.replaceAll("/", "_"), inPlay[id][index], pgnMove, i].join(SEPERATOR) + ".jpg"
-        fs.writeFile(path.join(dataDir, fileName), x.data, (err) => {
-            if (err) console.log(err)
-        })
-        return fileName
-    })
+    return (await Promise.all(images.map(async (x, i) => {
+        const fileName = [id, index, fen.replaceAll("/", "_"), inPlay[id][index], pgnMove, i].join(SEPERATOR) + ".jpeg"
+        try{
+            await Jimp.read(x.image) // check if image is corrupted
+            fs.writeFile(path.join(dataDir, fileName), x.image, (err) => {
+                if (err) console.log(err)
+            })
+            return {ip: x.ip, imageName: fileName}
+        }catch(e){
+            console.log("Corrupted Image from: " + x.ip)
+            return null;
+        }
+    }))).filter(x => x !== null)
+}
 
+app.get('/game/start/auto', async (_, res) => {
+    if (cams.length === 0) cams = await searchCAMS()
+    const id = Object.keys(allGames)[0]
+    inPlay[id] = [...allGames[id]]
+    delete allGames[id]
+    console.log(`Started Game ${id} with ${inPlay[id].length} moves!`)
+    res.send({
+        id
+    })
+})
+
+app.get('/game/start/manually', async (_, res) => {
+    if (cams.length === 0) cams = await searchCAMS()
+    const id = v4()
+    inPlay[id] = []
+    console.log(`Started Game manuel Game ${id}`)
+    res.send({
+        id
+    })
+})
+
+app.post('/game/next/auto/:id/:index', async (req, res) => {
+    const {id, index} = req.params
+    let nIndex = Number.parseInt(index)
+    const imageNames = await saveImage({id, index, ...req.body})
 
     // send back next move
     const finished = nIndex + 1 >= inPlay[id].length
     if (finished) {
         finishedGames[id] = true
-        delete inPlay[id]
         console.log(`Finished Game ${id} with ${inPlay[id].length} moves!`)
+        delete inPlay[id]
         saveFinishedGame()
     }
 
@@ -73,9 +133,28 @@ const handleSave = async (req, res) => {
         finished,
         images: imageNames
     });
-}
+})
 
-app.post('/game/save/:id/:index', handleSave)
+
+app.post('/game/next/manually/:id/:index', async (req, res) => {
+    const {id, index} = req.params
+    const {move} = req.body
+    inPlay[id][index] = move
+    const imageNames = await saveImage({id, index, ...req.body})
+    res.status(200).send({
+        images: imageNames
+    });
+})
+
+app.get('/game/finish/manually/:id', async (req, res) => {
+    const {id} = req.params
+    finishedGames[id] = true
+    console.log(`Finished Game ${id} with ${inPlay[id].length} moves!`)
+    delete inPlay[id]
+    saveFinishedGame()
+
+    res.status(200).send()
+})
 
 
 app.get('/game/delete/:id', (req, res) => {
@@ -113,52 +192,39 @@ app.get('/game/replace/:id/:index', [(req, res, next) => {
             })
     })
     next()
-}, handleSave])
+}, saveImage])
 
-app.get('/game/photo/list/:id', (req, res) => {
-    const {id} = req.params
-    res.send(fs.readdirSync(dataDir)
-        .filter(fileName => fileName.indexOf(`${id}${SEPERATOR}`) >= 0)
-        .reduce((acc, crr) => {
-            const index = crr.split(SEPERATOR)[1]
-            if (!acc[index]) acc[index] = 0
-            acc[index]++
-            return acc;
-        }, {}));
-})
 
-app.get('/game/finished', (_, res) => {
+app.get('/history/list', (_, res) => {
     res.send(finishedGames)
 })
 
-app.get('/game/photo/:id/:index', function (req, res) {
+app.get('/image/list/:id', function (req, res) {
+    const {id} = req.params
+    res.send(fs.readdirSync(dataDir)
+        .filter(fileName => fileName.indexOf(`${id}${SEPERATOR}`) >= 0))
+        .map(fileName => fileName + ".png")
+});
+
+app.get('/image/list/:id/:index', function (req, res) {
     const {id, index} = req.params
     res.send(fs.readdirSync(dataDir)
         .filter(fileName => fileName.indexOf(`${id}${SEPERATOR}${index}`) >= 0))
         .map(fileName => fileName + ".png")
 });
 
-app.get('/game/next', async (_, res) => {
-    if(cams.length === 0) cams = await searchCAMS()
-    const id = Object.keys(allGames)[0]
-    inPlay[id] = [...allGames[id]]
-    delete allGames[id]
-    console.log(`Started Game ${id} with ${inPlay[id].length} moves!`)
-    res.send({
-        id
-    })
+app.get('/image/:filename', (req, res) => {
+    const {filename} = req.params
+    res.sendFile(path.join(dataDir, filename))
 })
 
-app.get('/data/:name', (req, res) => {
-    const { name } = req.params
-    res.sendFile(path.join(dataDir, name))
-})
 
-app.get('/cams/search', async (_, res) => {
+app.get('/setup/cam/search', async (_, res) => {
     cams = await searchCAMS()
-    res.send({
+    console.log(cams)
+    res.send(
         cams
-    })
+    )
 })
 
 
@@ -203,11 +269,11 @@ async function searchCAMS() {
     // get photo
     return (await Promise.all(urls.map(async x => {
         try {
-            const response = await axios.get(x + "/picture", {
+            const response = await axios.get(x + "/heartbeat", {
                 responseType: 'arraybuffer',
                 timeout: 1000
             })
-            return response.status === 200 ? x : null
+            return response.status === 200 ? x.replace("http://", "") : null
         } catch (err) {
             return null
         }
